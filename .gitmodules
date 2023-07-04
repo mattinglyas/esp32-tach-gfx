@@ -1,3 +1,0 @@
-[submodule "lib/Serial_Can_Arduino"]
-	path = lib/Serial_Can_Arduino
-	url = https://github.com/mattinglyas/Serial_CAN_Arduino_ESP32C3.git
