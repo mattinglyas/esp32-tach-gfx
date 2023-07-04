@@ -1,0 +1,53 @@
+/*******************************************************************************
+ * Modified from HelloWorld example of Arduino_GFX
+ * run on Xiao ESP32C3 + 480x320 ILI9488 SPI TFT
+ ******************************************************************************/
+#include <Arduino_GFX_Library.h>
+
+#define TFT_CS    5   //GPIO5
+#define TFT_RESET 3   //GPIO3
+#define TFT_DC    4   //GPIO4
+#define TFT_MOSI  10  //GPIO10/MOSI
+#define TFT_SCK   8   //GPIO8/SCK
+#define TFT_LED   2   //GPIO2
+#define TFT_MISO  -1  // not used for TFT
+
+#define GFX_BL TFT_LED // backlight pin
+
+/* More data bus class: https://github.com/moononournation/Arduino_GFX/wiki/Data-Bus-Class */
+Arduino_DataBus *bus = new Arduino_HWSPI(TFT_DC, TFT_CS);
+
+/* More display class: https://github.com/moononournation/Arduino_GFX/wiki/Display-Class */
+Arduino_GFX *gfx = new Arduino_ILI9488_18bit(bus, TFT_RESET, 1 /* rotation */, false /* IPS */);
+
+
+/*******************************************************************************
+ * End of Arduino_GFX setting
+ ******************************************************************************/
+
+void setup(void)
+{
+    gfx->begin();
+    gfx->fillScreen(BLACK);
+
+#ifdef GFX_BL
+    pinMode(GFX_BL, OUTPUT);
+    digitalWrite(GFX_BL, HIGH);
+#endif
+
+    gfx->setCursor(10, 10);
+    gfx->setTextColor(RED);
+    gfx->println("Hello World!");
+
+    delay(5000); // 5 seconds
+}
+
+void loop()
+{
+    gfx->setCursor(random(gfx->width()), random(gfx->height()));
+    gfx->setTextColor(random(0xffff), random(0xffff));
+    gfx->setTextSize(random(6) /* x scale */, random(6) /* y scale */, random(2) /* pixel_margin */);
+    gfx->println("Hello World!");
+
+    delay(1000); // 1 second
+}
