@@ -36,9 +36,17 @@ Arduino_GFX *gfx = new Arduino_ILI9488_18bit(bus, TFT_RESET, 3 /* rotation */, f
  ******************************************************************************/
 
 #define CAN_SERIAL 0
+#define CAN_VMCU_ID 0x7E3
+#define CAN_VMCU_TACH 0x02
+
 Serial_CAN can;
 unsigned long id = 0;
 unsigned char dta[8];
+
+void sendPid(unsigned char __pid) {
+    unsigned char tmp[8] = {0x02, 0x01, __pid, 0, 0, 0, 0, 0};
+    can.send(CAN_VMCU_ID, 0, 0, 8, tmp);
+}
 
 /*******************************************************************************
  * End Serial CAN Bus settting
@@ -93,16 +101,27 @@ void loop()
 
     // delay(1000); // 1 second
 
-    if(can.recv(&id, dta))
+    Serial.println("New request...");
+    sendPid(CAN_VMCU_TACH);
+    unsigned long __timeout = millis();
+    while (millis() - __timeout < 1000) // 1s timeout
     {
-        Serial.print("GET DATA FROM ID: ");
-        Serial.println(id);
-        for(int i=0; i<8; i++)
-        {
-            Serial.print("0x");
-            Serial.print(dta[i], HEX);
-            Serial.print('\t');
+        unsigned long id = 0;
+        unsigned char buf[8];
+
+        if (can.recv(&id, buf)) {                // check if get data
+            for (int i = 0; i < 8; i++)
+            {
+                Serial.print(millis());
+                Serial.print(" ");
+                Serial.print("0x");
+                Serial.print(buf[i], HEX);
+                Serial.print('\t');
+            }
+            Serial.println();
+            break;
         }
-        Serial.println();
     }
+
+    delay(1000);
 }
