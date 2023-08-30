@@ -4,7 +4,8 @@
  ******************************************************************************/
 #include <Arduino_GFX_Library.h>
 #include <HardwareSerial.h>
-#include <Serial_CAN_Module.h>
+#include <stdio.h>
+#include <Serial_CAN_FD.h>
 
 /*******************************************************************************
  * Arduino_GFX setting
@@ -39,14 +40,40 @@ Arduino_GFX *gfx = new Arduino_ILI9488_18bit(bus, TFT_RESET, 3 /* rotation */, f
 #define CAN_VMCU_ID 0x7E3
 #define CAN_VMCU_TACH 0x02
 
-Serial_CAN can;
-unsigned long id = 0;
-unsigned char dta[8];
+HardwareSerial can_serial(CAN_SERIAL);
+unsigned long __id = 0;
+unsigned char __ext = 0;
+unsigned char __rtr = 0;
+unsigned char __fdf = 0;
+unsigned char __len = 0;
+unsigned char __dta_sz = 64;
+unsigned char __dta[64];
 
 void sendPid(unsigned char __pid) {
     unsigned char tmp[8] = {0x02, 0x01, __pid, 0, 0, 0, 0, 0};
-    can.send(CAN_VMCU_ID, 0, 0, 8, tmp);
+    can_send(CAN_VMCU_ID, 0, 0, 0, 8, tmp);
 }
+
+void uart_init(unsigned long baudrate)
+{
+    can_serial.begin(baudrate);
+}
+
+void uart_write(unsigned char c)
+{
+    can_serial.write(c);
+}
+
+unsigned char uart_read()
+{
+    return can_serial.read();
+}
+
+int uart_available()
+{
+    return can_serial.available();
+}
+
 
 /*******************************************************************************
  * End Serial CAN Bus settting
@@ -78,18 +105,8 @@ void setup(void)
     delay(5000); // 5 seconds
 
     // CAN setup
-    can.begin(CAN_SERIAL, 9600);
-    if (can.baudRate(SERIAL_RATE_115200)) {
-        Serial.println("Baud rate set!");
-    } else {
-        Serial.println("Baud rate not set!");
-    }
-
-    if (can.canRate(CAN_RATE_500)) {
-        Serial.println("Can rate set!");
-    } else {
-        Serial.println("Can rate not set!");
-    }
+    uart_init(115200);
+    can_speed_fd(500000, 500000); 
 }
 
 void loop()
@@ -106,16 +123,18 @@ void loop()
     unsigned long __timeout = millis();
     while (millis() - __timeout < 1000) // 1s timeout
     {
-        unsigned long id = 0;
-        unsigned char buf[8];
+        __id = 0;
+        for (int i = 0; i < __dta_sz; i++) {
+            __dta[i] = 0;
+        }
 
-        if (can.recv(&id, buf)) {                // check if get data
-            for (int i = 0; i < 8; i++)
+        if (read_can(&__id, &__ext, &__rtr, &__fdf, &__len, __dta)) {                // check if get data
+            for (int i = 0; i < __len; i++)
             {
                 Serial.print(millis());
                 Serial.print(" ");
                 Serial.print("0x");
-                Serial.print(buf[i], HEX);
+                Serial.print(__dta[i], HEX);
                 Serial.print('\t');
             }
             Serial.println();
