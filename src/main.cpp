@@ -1,8 +1,7 @@
-// RECV EXAMPLE OF SERIAL CAN MODULE
-// unsigned int read_can(unsigned long *id, unsigned char *ext, unsigned char *rtr, unsigned char *fdf, unsigned char *len, unsigned char *dta);
-// SUPPORT: info@longan-labs.cc
 #include "Serial_CAN_FD.h"
 #include <SoftwareSerial.h>
+#include <Arduino_GFX_Library.h>
+#include <stdbool.h>
 
 // see https://stackoverflow.com/questions/1644868/define-macro-for-debug-printing-in-c
 // TL;DR compliler should always see variables for refactoring, do {} while 0
@@ -21,8 +20,23 @@
             Serial.print(__VA_ARGS__); \
     } while (0);
 
+/*******************************************************************************
+ * Synchronization & FreeRTOS
+ ******************************************************************************/
+
+SemaphoreHandle_t __obd_info_mutex;
+volatile unsigned short __obd_rpm;
+volatile unsigned char __obd_speed;
+
+xTaskHandle __obd_task_handle;
+xTaskHandle __displayTask_handle;
+
+/*******************************************************************************
+ * Serial CAN Bus
+ ******************************************************************************/
+
 #define CAN_VMCU_ID 0x7DF
-#define CAN_VMCU_PID 0x0C
+#define CAN_RPM_PID 0x0C
 
 #define CAN_VIN_ID 0x7DF
 
@@ -35,9 +49,11 @@
 #define OBD_FRAME_BITMASK (0xF0)
 #define OBD_LEN_BITMASK (0x0F)
 
-HardwareSerial can_serial(0);
+#define OBD_REFRESH_MS 1000
 
-#define uart_can can_serial
+HardwareSerial __can_serial(0);
+
+#define uart_can __can_serial
 
 unsigned long __id = 0;                // can id
 unsigned char __ext = 0;               // extended frame or standard frame
@@ -46,9 +62,8 @@ unsigned char __fdf = 0;               // can fd or can 2.0
 unsigned char __len = 0;               // data length
 unsigned char __dta[CAN_DATA_BUF_LEN]; // data buffer (CAN layer)
 
-unsigned char __obd_len = 0;               // message length (OBD layer)
-unsigned char __obd_dta[OBD_DATA_BUF_LEN]; // data buffer (OBD layer)
-
+// required by can library
+// mixing method name conventions :(
 void uart_init(unsigned long baudrate)
 {
     uart_can.begin(baudrate);
@@ -69,41 +84,41 @@ int uart_available()
     return uart_can.available();
 }
 
-int can_receive_frame_blocking(
-    unsigned long *__id,
-    unsigned char *__ext,
-    unsigned char *__rtr,
-    unsigned char *__fdf,
-    unsigned char *__len,
-    unsigned char *__dta,
+int canReceiveFrameBlocking(
+    unsigned long *id,
+    unsigned char *ext,
+    unsigned char *rtr,
+    unsigned char *fdf,
+    unsigned char *len,
+    unsigned char *dta,
     unsigned long timeout_ms = -1)
 {
     int res = 0;
     while (millis() < timeout_ms)
     {
         // busy wait until timeout or read_can returns successful read
-        res = read_can(__id, __ext, __rtr, __fdf, __len, __dta);
+        res = read_can(id, ext, rtr, fdf, len, dta);
 
         if (res)
         {
             // Arduino serial doesn't support sprintf :(
             debug_print(millis());
             debug_print(" 0x");
-            debug_print(*__id, HEX);
+            debug_print(*id, HEX);
             debug_print(" ");
-            debug_print(*__ext);
+            debug_print(*ext);
             debug_print(" ");
-            debug_print(*__rtr);
+            debug_print(*rtr);
             debug_print(" ");
-            debug_print(*__fdf);
+            debug_print(*fdf);
             debug_print(" ");
-            debug_print(*__len);
+            debug_print(*len);
             debug_print(" ");
-            for (unsigned char i = 0; i < *__len; i++)
+            for (unsigned char i = 0; i < *len; i++)
             {
                 // should be optimized out by compiler if #define DEBUG 0
                 debug_print("0x");
-                debug_print(__dta[i], HEX);
+                debug_print(dta[i], HEX);
                 debug_print('\t');
             }
             debug_println();
@@ -116,7 +131,7 @@ int can_receive_frame_blocking(
     return 0;
 }
 
-int obd_receive_blocking(
+int obdReceiveBlocking(
     unsigned long id,
     unsigned char *len,
     unsigned char *buf,
@@ -138,7 +153,7 @@ int obd_receive_blocking(
     // get first frame
     debug_print(millis());
     debug_println(" receiving first frame... ");
-    res = can_receive_frame_blocking(
+    res = canReceiveFrameBlocking(
         &__id,
         &__ext,
         &__rtr,
@@ -165,6 +180,7 @@ int obd_receive_blocking(
     {
         // First
         unsigned short rem_len = 0;
+        // WARNING not portable check endianness of system!!
         obd_len = ((__dta[0] & OBD_LEN_BITMASK) << 8) | __dta[1];
         rem_len = obd_len - 6;
 
@@ -183,7 +199,7 @@ int obd_receive_blocking(
         // begin receiving until a timeout or all frames received
         do
         {
-            res = can_receive_frame_blocking(
+            res = canReceiveFrameBlocking(
                 &__id,
                 &__ext,
                 &__rtr,
@@ -194,6 +210,7 @@ int obd_receive_blocking(
 
             if (res)
             {
+                // WARNING not portable check endianness of system!!
                 frame_type = (__dta[0] & OBD_FRAME_BITMASK) >> 4;
                 unsigned char frame_counter = __dta[0] & OBD_LEN_BITMASK;
 
@@ -240,7 +257,7 @@ int obd_receive_blocking(
     return obd_len;
 }
 
-int obd_request_blocking(
+int obdRequestBlocking(
     unsigned long id,
     unsigned char *tmp,     // assumes that the caller allocates 8 bytes
     unsigned char *obd_len, // len of data from OBD II
@@ -255,7 +272,7 @@ int obd_request_blocking(
 
     // blocking receive
     timeout = millis() + timeout_ms_rel;
-    res = obd_receive_blocking(CAN_VIN_ID, obd_len, obd_dta, timeout);
+    res = obdReceiveBlocking(CAN_VIN_ID, obd_len, obd_dta, timeout);
     if (res > 0)
     {
         debug_println("Received: ");
@@ -263,7 +280,7 @@ int obd_request_blocking(
         {
             // compiler should optimize out this entire loop if #define DEBUG 0
             debug_print("0x");
-            debug_print(__obd_dta[i], HEX);
+            debug_print(obd_dta[i], HEX);
             debug_print('\t');
         }
         debug_println();
@@ -277,15 +294,15 @@ int obd_request_blocking(
     return res;
 }
 
-int obd_get_vin_blocking(unsigned long timeout_ms_rel = 1000)
+int obdGetVinBlocking(unsigned char *len, unsigned char *dta, unsigned long timeout_ms_rel = 1000)
 {
     debug_println("Asking for VIN...");
     unsigned char tmp[8] = {0x02, 0x09, 0x02, 0x55, 0x55, 0x55, 0x55, 0x55};
     // OBD request 0x7DF 0x02 0x09 0x02
-    return obd_request_blocking(CAN_VIN_ID, tmp, &__obd_len, __obd_dta, timeout_ms_rel);
+    return obdRequestBlocking(CAN_VIN_ID, tmp, len, dta, timeout_ms_rel);
 }
 
-int obd_pid_request_blocking(unsigned long id, unsigned char pid, unsigned long timeout_ms_rel = 1000)
+int obdPidRequestBlocking(unsigned long id, unsigned char pid, unsigned char *len, unsigned char *dta, unsigned long timeout_ms_rel = 1000)
 {
     debug_print("Requesting with ID: ");
     debug_print(id, HEX);
@@ -293,34 +310,423 @@ int obd_pid_request_blocking(unsigned long id, unsigned char pid, unsigned long 
     debug_println(pid, HEX);
 
     unsigned char tmp[8] = {0x02, 0x01, pid, 0x55, 0x55, 0x55, 0x55, 0x55};
-    return obd_request_blocking(id, tmp, &__obd_len, __obd_dta, timeout_ms_rel);
+    return obdRequestBlocking(id, tmp, len, dta, timeout_ms_rel);
 }
+
+/*******************************************************************************
+ * Arduino_GFX
+ ******************************************************************************/
+
+#define TFT_CS 5    // GPIO5
+#define TFT_RESET 3 // GPIO3
+#define TFT_DC 4    // GPIO4
+#define TFT_MOSI 10 // GPIO10/MOSI
+#define TFT_SCK 8   // GPIO8/SCK
+#define TFT_LED 2   // GPIO2
+#define TFT_MISO -1 // not used for TFT
+
+#define GFX_BL TFT_LED // backlight pin
+
+// storage for clipping line segments (see drawLineOnScreen)
+#define CL_INSIDE (0)
+#define CL_LEFT (1 << 0)
+#define CL_RIGHT (1 << 1)
+#define CL_BOTTOM (1 << 2)
+#define CL_TOP (1 << 3)
+
+#define DRAW_REFRESH_MS 20
+
+/* More data bus class: https://github.com/moononournation/Arduino_GFX/wiki/Data-Bus-Class */
+Arduino_DataBus *__bus;
+Arduino_GFX *__gfx;
+
+/* coordinates for 'z' plane lines derived from MATLAB script in matrix_test in x, y pixels */
+#define NUM_Z_PLANE_VERT 13
+#define NUM_Z_PLANE_HORIZ 9
+#define Z_PLANE_COLOR CYAN
+// original parameters for z plane derived from MATLAB script
+#define Y_HEIGHT -4.
+// camera parameters
+#define ZNEAR 3
+#define ZFAR 50
+#define FOV (1 / tan(45)) // 1 / tan(THETA / 2)
+
+int32_t __z_grid_x0[NUM_Z_PLANE_VERT] = {-353, -254, -155, -56, 42, 141, 240, 339, 438, 536, 635, 734, 833};
+int32_t __z_grid_y0[NUM_Z_PLANE_VERT] = {358, 358, 358, 358, 358, 358, 358, 358, 358, 358, 358, 358, 358};
+int32_t __z_grid_x1[NUM_Z_PLANE_VERT] = {42, 75, 108, 141, 174, 207, 240, 273, 306, 339, 372, 405, 438};
+int32_t __z_grid_y1[NUM_Z_PLANE_VERT] = {226, 226, 226, 226, 226, 226, 226, 226, 226, 226, 226, 226, 226};
+
+// using fixed point math to store the z coordinate of the horizontal lines
+#define ZS_SCALE_FACTOR 1000
+#define ZS_MIN (4 * ZS_SCALE_FACTOR)
+#define ZS_MAX (12 * ZS_SCALE_FACTOR)
+int32_t __z_grid_zs[NUM_Z_PLANE_HORIZ];
+
+// converts a world y and z coordinate into an on-screen y coordinate
+inline int32_t y_height_from_z(double y, double z) {
+    double height = (double) __gfx->height();
+    double proj = FOV * y;
+    double persp = proj / z;
+    double pxels = persp * height + height / 2;
+    return height - pxels;
+}
+
+inline bool inRangeInc(int32_t val, int32_t lower, int32_t upper)
+{
+    return (val >= lower && upper >= val);
+}
+
+// helper for cohen-sutherland clipping
+inline unsigned char cohenSutherlandCode(int32_t x, int32_t y, int32_t width, int32_t height)
+{
+    unsigned char code = CL_INSIDE;
+
+    if (x < 0)
+        code |= CL_LEFT;
+    else if (x > width)
+        code |= CL_RIGHT;
+
+    if (y < 0)
+        code |= CL_TOP;
+    else if (y > height)
+        code |= CL_BOTTOM;
+
+    return code;
+}
+
+// clips line so coordinates fall within (0, width), (0, height)
+// returns true if line segment can be drawn or false if no part of the segment
+// is on screen
+// https://www.geeksforgeeks.org/line-clipping-set-1-cohen-sutherland-algorithm/
+bool cohenSutherlandClip(int32_t *x0, int32_t *y0, int32_t *x1, int32_t *y1, int32_t width, int32_t height)
+{
+    // calculate codes for both coordinates
+    unsigned char code0 = cohenSutherlandCode(*x0, *y0, width, height);
+    unsigned char code1 = cohenSutherlandCode(*x1, *y1, width, height);
+
+    // track if line is entirely outside of window
+    bool accept = false;
+
+    // iterate through codes and adjust coordinates as needed
+    // loop runs at most four times
+    while ((code0 != code1) && (code0 | code1))
+    {
+        unsigned char code_out;
+        int32_t x, y;
+
+        if (code0)
+            code_out = code0;
+        else
+            code_out = code1;
+
+        // find intersection point
+        // TODO is there a better way to get coords than integer division?
+        if (code_out & CL_TOP)
+        {
+            x = *x0 + (*x1 - *x0) * (0 - *y0) / (*y1 - *y0);
+            y = 0;
+        }
+        else if (code_out & CL_BOTTOM)
+        {
+            x = *x0 + (*x1 - *x0) * (height - *y0) / (*y1 - *y0);
+            y = height;
+        }
+        else if (code_out & CL_RIGHT)
+        {
+            x = width;
+            y = *y0 + (*y1 - *y0) * (width - *x0) / (*x1 - *x0);
+        }
+        else if (code_out & CL_LEFT)
+        {
+            x = 0;
+            y = *y0 + (*y1 - *y0) * (0 - *x0) / (*x1 - *x0);
+        }
+        else
+        {
+            // something must have gone wrong to get here...
+        }
+
+        if (code_out == code0)
+        {
+            *x0 = x;
+            *y0 = y;
+            code0 = cohenSutherlandCode(*x0, *y0, width, height);
+        }
+        else
+        {
+            *x1 = x;
+            *y1 = y;
+            code1 = cohenSutherlandCode(*x1, *y1, width, height);
+        }
+    }
+
+    // line can now be drawn on screen if both segment codes are 0 (centered)
+    // otherwise, code0 and code1 match, indiciating that both endpoints are
+    // offscreen
+    return ((code0 | code1) == CL_INSIDE);
+}
+
+// convert coordinates to ready-to-draw coordinates with cohenSutherland
+void initZPlaneLinesVert()
+{
+    for (int i = 0; i < NUM_Z_PLANE_VERT; i++)
+    {
+        cohenSutherlandClip(
+            &__z_grid_x0[i], 
+            &__z_grid_y0[i], 
+            &__z_grid_x1[i], 
+            &__z_grid_y1[i], 
+            __gfx->width(), 
+            __gfx->height()
+            );
+    }
+}
+
+// ready storage for horizontal lines world coordinates by linspace
+void initZPlaneLinesHoriz() 
+{
+    int32_t delta = (ZS_MAX - ZS_MIN) / (NUM_Z_PLANE_HORIZ - 1);
+    for (int i = 0; i < NUM_Z_PLANE_HORIZ; i++) 
+    {
+        __z_grid_zs[i] = ZS_MIN + delta * i;
+    }
+}
+
+void drawZPlaneVert(int16_t color)
+{
+    for (int i = 0; i < NUM_Z_PLANE_VERT; i++) 
+    {
+        __gfx->drawLine(__z_grid_x0[i], __z_grid_y0[i], __z_grid_x1[i], __z_grid_y1[i], color);
+    }
+}
+
+void drawZPlaneHoriz(int32_t *zs, int16_t color)
+{
+    double z;
+    int32_t y;
+
+    for (int i = 0; i < NUM_Z_PLANE_HORIZ; i++)
+    {
+        // convert world coordinates into pixel coordinates
+        z = ((double) zs[i]) / ZS_SCALE_FACTOR;
+        y = y_height_from_z(Y_HEIGHT, z);
+
+        __gfx->drawFastHLine(0, y, __gfx->width(), color);
+    }
+}
+
+void updateZPlaneHoriz(int32_t *old_zs, int32_t *new_zs, int16_t color)
+{
+    double z0, z1;
+    int32_t y0, y1;
+
+    for (int i = 0; i < NUM_Z_PLANE_HORIZ; i++)
+    {
+        // convert world coordinates into pixel coordinates
+        z0 = ((double) old_zs[i]) / ZS_SCALE_FACTOR;
+        y0 = y_height_from_z(Y_HEIGHT, z0);
+
+        z1 = ((double) new_zs[i]) / ZS_SCALE_FACTOR;
+        y1 = y_height_from_z(Y_HEIGHT, z1);
+
+        if (y0 != y1)
+        {
+            __gfx->drawFastHLine(0, y0, __gfx->width(), BLACK);
+            __gfx->drawFastHLine(0, y1, __gfx->width(), color);
+        }
+    }
+}
+
+// advance all horizontal lines by some amount
+// assumes amount is smaller than (ZS_MAX - ZS_MIN)
+void advanceZPlaneHoriz(int32_t amount)
+{
+    int32_t rel;
+    for (int i = 0; i < NUM_Z_PLANE_HORIZ; i++)
+    {
+        rel = __z_grid_zs[i] + amount;
+        if (rel < ZS_MIN) rel += (ZS_MAX - ZS_MIN);
+        else if (rel > ZS_MAX) rel -= (ZS_MAX - ZS_MIN);
+        __z_grid_zs[i] = rel;
+    }
+}
+
+/*******************************************************************************
+ * Tasks
+ ******************************************************************************/
+
+// debug task to feed draw task dummy data
+void fakeObdTask(void *pv_parameters)
+{
+    // task runs every OBD_REFRESH_MS to grab updates from vehicle
+    TickType_t x_last_wake_time;
+    const TickType_t x_period = pdMS_TO_TICKS(OBD_REFRESH_MS);
+
+    // init with current time for updates
+    x_last_wake_time = xTaskGetTickCount();
+
+    for (;;)
+    {
+        // wait for next cycle
+        vTaskDelayUntil(&x_last_wake_time, x_period);
+
+        // WARNING not portable check endianness of system!!
+        // equivalent to (obd_dta[3] * 256) + obd_data[4]
+        xSemaphoreTake(__obd_info_mutex, portMAX_DELAY);
+        __obd_rpm = (((unsigned char) random(255)) << 8) | (unsigned char) random(255);
+        __obd_speed = (unsigned char) random(255);
+        xSemaphoreGive(__obd_info_mutex);
+    }
+}
+
+void obdTask(void *pv_parameters)
+{
+    unsigned char obd_len = 0;               // message length (OBD layer)
+    unsigned char obd_dta[OBD_DATA_BUF_LEN]; // data buffer (OBD layer)
+    int res;
+
+    debug_print("Begin can...");
+    uart_init(9600);
+    delay(100);
+    can_speed_fd(500000, 500000); // set can bus baudrate to 500k
+    delay(100);
+    debug_println("done");
+
+    // task runs every OBD_REFRESH_MS to grab updates from vehicle
+    TickType_t x_last_wake_time;
+    const TickType_t x_period = pdMS_TO_TICKS(OBD_REFRESH_MS);
+
+    // start by getting VIN
+    obdGetVinBlocking(&obd_len, obd_dta, 200);
+
+    // init with current time for updates
+    x_last_wake_time = xTaskGetTickCount();
+
+    for (;;)
+    {
+        // wait for next cycle
+        vTaskDelayUntil(&x_last_wake_time, x_period);
+
+        res = obdPidRequestBlocking(CAN_VMCU_ID, CAN_RPM_PID, &obd_len, obd_dta, 200);
+        if (res > 0 && obd_len == 4)
+        {
+            // WARNING not portable check endianness of system!!
+            // equivalent to (obd_dta[3] * 256) + obd_data[4]
+            xSemaphoreTake(__obd_info_mutex, portMAX_DELAY);
+            __obd_rpm = (obd_dta[3] << 8) | obd_dta[4];
+            xSemaphoreGive(__obd_info_mutex);
+        }
+    }
+}
+
+void displayTask(void *pv_parameters)
+{
+    // set up tft display
+    __gfx->begin();
+    pinMode(GFX_BL, OUTPUT);
+    digitalWrite(GFX_BL, HIGH);
+    __gfx->fillScreen(BLACK);
+
+    // task runs every DRAW_REFRESH_MS to grab updates from vehicle
+    TickType_t x_last_wake_time;
+    const TickType_t x_period = pdMS_TO_TICKS(DRAW_REFRESH_MS);
+
+    // init with current time for updates
+    x_last_wake_time = xTaskGetTickCount();
+
+    // ready zPlaneLines background
+    initZPlaneLinesVert();
+    initZPlaneLinesHoriz();
+
+    // draw first frame
+    drawZPlaneVert(Z_PLANE_COLOR);
+    drawZPlaneHoriz(__z_grid_zs, Z_PLANE_COLOR);
+
+    int32_t old_zs[NUM_Z_PLANE_HORIZ];
+    uint16_t old_rpm;
+    int16_t speed;
+    uint16_t rpm;
+
+    for (;;)
+    {
+        // wait for next cycle
+        vTaskDelayUntil(&x_last_wake_time, x_period);
+
+        // get speed and RPM from obd info
+        xSemaphoreTake(__obd_info_mutex, portMAX_DELAY);
+        speed = __obd_speed;
+        rpm = __obd_rpm;
+        xSemaphoreGive(__obd_info_mutex);
+
+        // update RPM display
+        rpm /= 4;
+        if (old_rpm != rpm)
+        {
+            __gfx->setTextSize(5);
+            __gfx->setCursor(30, 30);
+            __gfx->setTextColor(BLACK);
+            __gfx->print(old_rpm);
+            __gfx->setTextColor(Z_PLANE_COLOR);
+            __gfx->setCursor(30, 30);
+            __gfx->print(rpm);
+        }
+        old_rpm = rpm;
+
+        // save previous z grid frame for erasing
+        memcpy(old_zs, __z_grid_zs, sizeof(int32_t) * NUM_Z_PLANE_HORIZ);
+
+        // advance Z plane
+        advanceZPlaneHoriz(-speed);
+        updateZPlaneHoriz(old_zs, __z_grid_zs, Z_PLANE_COLOR);
+
+        // draw verticals in case pixels were erased in advancing horizontals
+        drawZPlaneVert(Z_PLANE_COLOR);
+
+        // draw top line in case it was erased
+        __gfx->drawFastHLine(0, y_height_from_z(Y_HEIGHT, ZS_MAX / ZS_SCALE_FACTOR), __gfx->width(), Z_PLANE_COLOR);
+    }
+}
+
+/*******************************************************************************
+ * Sketch
+ ******************************************************************************/
 
 void setup()
 {
     if (DEBUG)
     {
         Serial.begin(115200);
-        delay(100);
-        debug_print("Begin can...");
+        vTaskDelay(2500);
     }
-    delay(100);
 
-    uart_init(9600);
-    delay(100);
-    can_speed_fd(500000, 500000); // set can bus baudrate to 500k
-    delay(100);
+    __bus = new Arduino_HWSPI(TFT_DC, TFT_CS);
+    __gfx = new Arduino_ILI9488_18bit(__bus, TFT_RESET, 3 /* rotation */, false /* IPS */);
 
-    debug_println("done");
+    __obd_info_mutex = xSemaphoreCreateMutex();
 
-    delay(2000);
-    obd_get_vin_blocking(200);
+    debug_println("Starting tasks...");
+    xTaskCreatePinnedToCore(
+        fakeObdTask,
+        "OBD Task",
+        OBD_DATA_BUF_LEN + 4096,
+        nullptr,
+        10,
+        &__obd_task_handle,
+        1);
+
+    xTaskCreatePinnedToCore(
+        displayTask,
+        "Display Task",
+        65536,
+        nullptr,
+        10,
+        &__displayTask_handle,
+        1);
 }
 
 void loop()
 {
-    delay(1000);
-    obd_pid_request_blocking(CAN_VMCU_ID, CAN_VMCU_PID, 200);
+    // nothing here
 }
 
 // END FILE
