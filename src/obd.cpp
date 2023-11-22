@@ -1,6 +1,6 @@
 #include <HardwareSerial.h>
 #include <Serial_CAN_FD.h>
-#include <can.h>
+#include <obd.h>
 #include <debug.h>
 
 unsigned long __id = 0;                // can id
@@ -9,29 +9,6 @@ unsigned char __rtr = 0;               // remote frame or data frame
 unsigned char __fdf = 0;               // can fd or can 2.0
 unsigned char __len = 0;               // data length
 unsigned char __dta[CAN_DATA_BUF_LEN]; // data buffer (CAN layer)
-HardwareSerial __can_serial(0);
-
-// required by can library
-// mixing method name conventions :(
-void uart_init(unsigned long baudrate)
-{
-    uart_can.begin(baudrate);
-}
-
-void uart_write(unsigned char c)
-{
-    uart_can.write(c);
-}
-
-unsigned char uart_read()
-{
-    return uart_can.read();
-}
-
-int uart_available()
-{
-    return uart_can.available();
-}
 
 int canReceiveFrameBlocking(
     unsigned long *id,
@@ -42,8 +19,9 @@ int canReceiveFrameBlocking(
     unsigned char *dta,
     unsigned long timeout_ms = -1)
 {
+    unsigned long start = millis();
     int res = 0;
-    while (millis() < timeout_ms)
+    while (millis() - start < timeout_ms)
     {
         // busy wait until timeout or read_can returns successful read
         res = read_can(id, ext, rtr, fdf, len, dta);
@@ -89,19 +67,22 @@ int obdReceiveBlocking(
     // does blocking reads until
     // * Frames with target id (id + 0x08) are received (including consecutive);
     //      returning length stored to buf
-    // * millis() >= timeout_ms; returning -1
+    // * timeout_ms ms elapses since calling; returning -1
     // * expected frame type mismatch; returning -2
     // * frame missed; returning -3
 
     int res = 0;
     unsigned short obd_len = 0;
     unsigned char frame_type = 0;
+    unsigned long start = millis();
+    unsigned long elapsed;
 
     *len = 0;
 
     // get first frame
     debug_print(millis());
     debug_println(" receiving first frame... ");
+    elapsed = millis();
     res = canReceiveFrameBlocking(
         &__id,
         &__ext,
@@ -109,7 +90,7 @@ int obdReceiveBlocking(
         &__fdf,
         &__len,
         __dta,
-        timeout_ms);
+        timeout_ms - (elapsed - start));
 
     // if we get a timeout then return
     if (res == 0)
@@ -148,6 +129,7 @@ int obdReceiveBlocking(
         // begin receiving until a timeout or all frames received
         do
         {
+            elapsed = millis();
             res = canReceiveFrameBlocking(
                 &__id,
                 &__ext,
@@ -155,7 +137,7 @@ int obdReceiveBlocking(
                 &__fdf,
                 &__len,
                 __dta,
-                timeout_ms);
+                timeout_ms - (elapsed - start));
 
             if (res)
             {
@@ -211,16 +193,14 @@ int obdRequestBlocking(
     unsigned char *tmp,     // assumes that the caller allocates 8 bytes
     unsigned char *obd_len, // len of data from OBD II
     unsigned char *obd_dta, // data from OBD II
-    unsigned long timeout_ms_rel = 1000)
+    unsigned long timeout = 1000)
 {
     int res = 0;
-    unsigned long timeout;
 
     // id, extended/standard frame, remote/data frame, can fd/2.0, data len, buf
     can_send(id, 0, 0, 0, 8, tmp);
 
     // blocking receive
-    timeout = millis() + timeout_ms_rel;
     res = obdReceiveBlocking(CAN_VIN_ID, obd_len, obd_dta, timeout);
     if (res > 0)
     {
