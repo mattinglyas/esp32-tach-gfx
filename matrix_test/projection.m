@@ -1,6 +1,6 @@
 % simple test of projection used for tachometer animation
 
-theta = 90; % degree FOV
+theta = pi / 2; % degree FOV
 screenx = 480;
 screeny = 320;
 a = screeny / screenx; % h/w aspect ratio
@@ -17,10 +17,10 @@ f = 1 / tan(theta / 2);
 t = [a*f 0 0 0; 0 f 0 0; 0 0 lm -lm*znear; 0 0 1 0];
 
 % some test coordinates
-x = linspace(-12, 12, 13);
-z = linspace(4, 12, 13);
+x = linspace(-14, 14, 17);
+z = linspace(4, 12, 9);
 [X, Z] = meshgrid(x, z);
-Y = ones(size(X)) * -4;
+Y = ones(size(X)) * -2;
 W = ones(size(X));
 coords = [X(:) Y(:) Z(:) W(:)]';
 

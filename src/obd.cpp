@@ -1,7 +1,7 @@
 #include <HardwareSerial.h>
 #include <Serial_CAN_FD.h>
 #include <obd.h>
-#include <debug.h>
+#include <DebugLog.h>
 
 unsigned long __id = 0;                // can id
 unsigned char __ext = 0;               // extended frame or standard frame
@@ -28,33 +28,10 @@ int canReceiveFrameBlocking(
 
         if (res)
         {
-            // Arduino serial doesn't support sprintf :(
-            debug_print(millis());
-            debug_print(" 0x");
-            debug_print(*id, HEX);
-            debug_print(" ");
-            debug_print(*ext);
-            debug_print(" ");
-            debug_print(*rtr);
-            debug_print(" ");
-            debug_print(*fdf);
-            debug_print(" ");
-            debug_print(*len);
-            debug_print(" ");
-            for (unsigned char i = 0; i < *len; i++)
-            {
-                // should be optimized out by compiler if #define DEBUG 0
-                debug_print("0x");
-                debug_print(dta[i], HEX);
-                debug_print('\t');
-            }
-            debug_println();
-
             return res;
         }
     }
-    debug_print(millis());
-    debug_println(" timeout waiting for frame");
+    LOG_DEBUG(" timeout waiting for frame");
     return 0;
 }
 
@@ -80,8 +57,7 @@ int obdReceiveBlocking(
     *len = 0;
 
     // get first frame
-    debug_print(millis());
-    debug_println(" receiving first frame... ");
+    LOG_DEBUG("Receiving first frame... ");
     elapsed = millis();
     res = canReceiveFrameBlocking(
         &__id,
@@ -119,9 +95,7 @@ int obdReceiveBlocking(
 
         // let the transmitter know that it is OK to send remaining frames
         // OBD flow frame 0x30 0x00 0x0A (0x0A ms delay between consecutive)
-        debug_print("Sending flow control for remaining ");
-        debug_print(rem_len);
-        debug_println(" bytes...");
+        LOG_DEBUG("Sending flow control for remaining", rem_len, "bytes...");
         unsigned char tmp[8] = {0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
         unsigned short frame_num = 1;
         can_send(0x7E0, 0, 0, 0, 8, tmp);
@@ -204,20 +178,11 @@ int obdRequestBlocking(
     res = obdReceiveBlocking(CAN_VIN_ID, obd_len, obd_dta, timeout);
     if (res > 0)
     {
-        debug_println("Received: ");
-        for (int i = 0; i < *obd_len; i++)
-        {
-            // compiler should optimize out this entire loop if #define DEBUG 0
-            debug_print("0x");
-            debug_print(obd_dta[i], HEX);
-            debug_print('\t');
-        }
-        debug_println();
+        LOG_DEBUG("Received", *obd_len, "bytes");
     }
     else
     {
-        debug_print("Error receiving, code ");
-        debug_println(res);
+        LOG_DEBUG("Error receiving, code", res);
     }
 
     return res;

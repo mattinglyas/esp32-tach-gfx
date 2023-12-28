@@ -1,55 +1,54 @@
-#include "Serial_CAN_FD.h"
+#include <Serial_CAN_FD.h>
 #include <Arduino_GFX_Library.h>
 #include <stdbool.h>
-#include <obd.h>
-#include <debug.h>
 #include <stdint.h>
-#include <3d.h>
+#include <DebugLog.h>
+#include <3fx_fixed.hpp>
+#include "obd.h"
 
 /*******************************************************************************
  * Synchronization & FreeRTOS
  ******************************************************************************/
 
-SemaphoreHandle_t __obd_info_mutex;
-volatile unsigned short __obd_rpm;
-volatile unsigned char __obd_speed;
+SemaphoreHandle_t obd_info_mutex;
+volatile unsigned short obd_rpm;
+volatile unsigned char obd_speed;
 
-xTaskHandle __obd_task_handle;
-xTaskHandle __displayTask_handle;
+xTaskHandle obd_task_handle;
+xTaskHandle displayTask_handle;
 
 /*******************************************************************************
  * Serial CAN Bus
  ******************************************************************************/
 
-HardwareSerial __can_serial(0);
+HardwareSerial can_serial(0);
 #define OBD_REFRESH_MS 2000
 
 // required by can library
 // mixing method name conventions :(
 void uart_init(unsigned long baudrate)
 {
-    __can_serial.begin(baudrate);
+    can_serial.begin(baudrate);
 }
 
 void uart_write(unsigned char c)
 {
-    __can_serial.write(c);
+    can_serial.write(c);
 }
 
 unsigned char uart_read()
 {
-    return __can_serial.read();
+    return can_serial.read();
 }
 
 int uart_available()
 {
-    return __can_serial.available();
+    return can_serial.available();
 }
-
 
 int obdGetVinBlocking(unsigned char *len, unsigned char *dta, unsigned long timeout_ms_rel = 1000)
 {
-    debug_println("Asking for VIN...");
+    LOG_DEBUG("Asking for VIN...");
     unsigned char tmp[8] = {0x02, 0x09, 0x02, 0x55, 0x55, 0x55, 0x55, 0x55};
     // OBD request 0x7DF 0x02 0x09 0x02
     return obdRequestBlocking(CAN_VIN_ID, tmp, len, dta, timeout_ms_rel);
@@ -57,14 +56,13 @@ int obdGetVinBlocking(unsigned char *len, unsigned char *dta, unsigned long time
 
 int obdPidRequestBlocking(unsigned long id, unsigned char pid, unsigned char *len, unsigned char *dta, unsigned long timeout_ms_rel = 1000)
 {
-    debug_print("Requesting with ID: ");
-    debug_print(id, HEX);
-    debug_print(", PID: ");
-    debug_println(pid, HEX);
+    LOG_DEBUG("Requesting with ID:", id, "PID", pid);
 
     unsigned char tmp[8] = {0x02, 0x01, pid, 0x55, 0x55, 0x55, 0x55, 0x55};
     return obdRequestBlocking(id, tmp, len, dta, timeout_ms_rel);
 }
+
+
 
 /*******************************************************************************
  * Arduino_GFX
@@ -81,110 +79,70 @@ int obdPidRequestBlocking(unsigned long id, unsigned char pid, unsigned char *le
 #define GFX_BL TFT_LED // backlight pin
 #define DRAW_REFRESH_MS 1000
 
-// parameters for generating perspective grid
-#define Z_PLANE_COLOR CYAN
-#define NUM_Z_PLANE_VERT 17
-#define NUM_Z_PLANE_HORIZ 9
-#define XS_MIN (-14 * WORLD_SCALE_FACTOR)
-#define XS_MAX (14 * WORLD_SCALE_FACTOR)
-#define ZS_MIN (4 * WORLD_SCALE_FACTOR)
-#define ZS_MAX (12 * WORLD_SCALE_FACTOR)
-#define Y_HEIGHT (-4 * WORLD_SCALE_FACTOR)
+#define RPM_X 86
+#define RPM_Y 40
 
-// linearly scale speed and rpm
-#define SPEED_SCALE 10
-#define SPEED_B 10
-
-#define RPM_SCALE 5000
-#define RPM_B 10
-
-line3d __z_grid_horiz[NUM_Z_PLANE_HORIZ];
-line3d __z_grid_vert[NUM_Z_PLANE_VERT];
-
-// init grid by linspace
-void initGridWorldCoordinates()
+void updateRPM(Arduino_GFX *gfx, int16_t x, int16_t y, int32_t rpm, int32_t rpm_old, int16_t color, int16_t background)
 {
-    int32_t delta;
-    // horizontals
-    delta = (ZS_MAX - ZS_MIN) / (NUM_Z_PLANE_HORIZ - 1);
-    for (int i = 0; i < NUM_Z_PLANE_HORIZ; i++)
+    int32_t thousands = rpm / 1000;
+    int32_t hundreds = rpm % 1000;
+    int32_t thousands_old = rpm_old / 1000;
+    int32_t hundreds_old = rpm_old % 1000;
+
+    char buf0[8];
+    char buf1[8];
+    memset(buf0, 0, 8);
+    memset(buf1, 0, 8);
+
+    //thousands
+    snprintf(buf0, 8, "%02d", thousands);
+    snprintf(buf1, 8, "%02d", thousands_old);
+
+    // only need to draw the difference between the two old and new values
+    for (int i = 0; buf0[i] != 0; i++)
     {
-        __z_grid_horiz[i].p1.x = XS_MIN;
-        __z_grid_horiz[i].p1.y = Y_HEIGHT;
-        __z_grid_horiz[i].p1.z = (ZS_MIN + delta * i);
-
-        __z_grid_horiz[i].p2.x = XS_MAX;
-        __z_grid_horiz[i].p2.y = Y_HEIGHT;
-        __z_grid_horiz[i].p2.z = (ZS_MIN + delta * i);
-    }
-
-    // vertical
-    delta = (XS_MAX - XS_MIN) / (NUM_Z_PLANE_VERT - 1);
-    for (int i = 0; i < NUM_Z_PLANE_VERT; i++)
-    {
-        __z_grid_vert[i].p1.x = (XS_MIN + delta * i);
-        __z_grid_vert[i].p1.y = Y_HEIGHT;
-        __z_grid_vert[i].p1.z = ZS_MIN;
-
-        __z_grid_vert[i].p2.x = (XS_MIN + delta * i);
-        __z_grid_vert[i].p2.y = Y_HEIGHT;
-        __z_grid_vert[i].p2.z = ZS_MAX;
-    }
-}
-
-// moves the grid by dx and dz and scrolls the grid lines if they underflow or 
-// overflow
-void updateGridWorldCoordinates(int32_t dx, int32_t dz)
-{
-    int32_t temp;
-    for (int i = 0; i < NUM_Z_PLANE_HORIZ; i++)
-    {
-        temp = __z_grid_horiz[i].p1.z + dz;
-
-        if (temp > ZS_MAX) {
-            temp -= (ZS_MAX - ZS_MIN);
-        } 
-        else if (temp < ZS_MIN)
+        if (buf0[i] == buf1[i]) 
         {
-            temp += (ZS_MAX - ZS_MIN);
+            buf0[i] = ' ';
+            buf1[i] = ' ';
         }
-
-        __z_grid_horiz[i].p1.z = temp;
-        __z_grid_horiz[i].p2.z = temp;
     }
+    // erase old 
+    gfx->setCursor(x, y);
+    gfx->setTextColor(background);
+    gfx->setTextSize(15, 15);
+    gfx->print(buf1);
 
-    // vertical
-    for (int i = 0; i < NUM_Z_PLANE_VERT; i++)
+    // draw new
+    gfx->setCursor(x, y);
+    gfx->setTextColor(color);
+    gfx->setTextSize(15, 15);
+    gfx->print(buf0);
+
+    // hundreds
+    snprintf(buf0, 8, "%03d", hundreds);
+    snprintf(buf1, 8, "%03d", hundreds_old);
+
+    // only need to draw the difference between the two old and new values
+    for (int i = 0; buf0[i] != 0; i++)
     {
-        temp = __z_grid_vert[i].p1.x + dx;
-
-        if (temp > XS_MAX) {
-            temp -= (XS_MAX - XS_MIN);
-        } 
-        else if (temp < XS_MIN)
+        if (buf0[i] == buf1[i]) 
         {
-            temp += (XS_MAX - XS_MIN);
+            buf0[i] = ' ';
+            buf1[i] = ' ';
         }
-
-        __z_grid_vert[i].p1.x = temp;
-        __z_grid_vert[i].p2.x = temp;
     }
-}
+    // erase old 
+    gfx->setCursor(x + 180, y);
+    gfx->setTextColor(background);
+    gfx->setTextSize(7, 7);
+    gfx->print(buf1);
 
-void drawZPlaneVert(Arduino_GFX *gfx, int16_t color)
-{
-    for (int i = 0; i < NUM_Z_PLANE_VERT; i++) 
-    {
-        drawLine3d(gfx, __z_grid_vert[i], color);
-    }
-}
-
-void drawZPlaneHoriz(Arduino_GFX *gfx, int16_t color)
-{
-    for (int i = 0; i < NUM_Z_PLANE_HORIZ; i++)
-    {
-        drawLine3d(gfx, __z_grid_horiz[i], color);
-    }
+    // draw new
+    gfx->setCursor(x + 180, y);
+    gfx->setTextColor(color);
+    gfx->setTextSize(7, 7);
+    gfx->print(buf0);
 }
 
 void drawRPMHeader(Arduino_GFX *gfx, int16_t x, int16_t y, int16_t color)
@@ -193,29 +151,6 @@ void drawRPMHeader(Arduino_GFX *gfx, int16_t x, int16_t y, int16_t color)
     gfx->setTextColor(color);
     gfx->setTextSize(7,7);
     gfx->print("RPM");
-}
-
-void drawRPM(Arduino_GFX *gfx, int16_t x, int16_t y, int32_t rpm, int16_t color)
-{
-    int32_t thousands = rpm / 1000;
-    int32_t hundreds = rpm % 1000;
-
-    // small buffer for sprintf
-    char buf[8];
-    memset(buf, 0, 8);
-
-    // thousands
-    snprintf(buf, 8, "%02d", thousands);
-    gfx->setCursor(x, y);
-    gfx->setTextColor(color);
-    gfx->setTextSize(15, 15);
-    gfx->print(buf);
-
-    // hundreds
-    snprintf(buf, 8, "%03d", hundreds);
-    gfx->setCursor(x + 180, y);
-    gfx->setTextSize(7, 7);
-    gfx->print(buf);
 }
 
 /*******************************************************************************
@@ -239,10 +174,10 @@ void fakeObdTask(void *pv_parameters)
 
         // WARNING not portable check endianness of system!!
         // equivalent to (obd_dta[3] * 256) + obd_data[4]
-        xSemaphoreTake(__obd_info_mutex, portMAX_DELAY);
-        __obd_rpm = (((unsigned char) random(255)) << 8) | (unsigned char) random(255);
-        __obd_speed = (unsigned char) random(255);
-        xSemaphoreGive(__obd_info_mutex);
+        xSemaphoreTake(obd_info_mutex, portMAX_DELAY);
+        obd_rpm = (((unsigned char) random(255)) << 8) | (unsigned char) random(255);
+        obd_speed = (unsigned char) random(255);
+        xSemaphoreGive(obd_info_mutex);
     }
 }
 
@@ -252,10 +187,10 @@ void obdTask(void *pv_parameters)
     unsigned char obd_dta[OBD_DATA_BUF_LEN]; // data buffer (OBD layer)
     int res;
 
-    debug_print("Begin can...");
+    LOG_INFO("Begin can...");
     uart_init(9600);
     can_speed_fd(500000, 500000); // set can bus baudrate to 500k
-    debug_println("done");
+    LOG_INFO("done");
 
     // task runs every OBD_REFRESH_MS to grab updates from vehicle
     TickType_t x_last_wake_time;
@@ -278,19 +213,10 @@ void obdTask(void *pv_parameters)
         {
             // WARNING not portable check endianness of system!!
             // equivalent to (obd_dta[3] * 256) + obd_data[4]
-            xSemaphoreTake(__obd_info_mutex, portMAX_DELAY);
-            __obd_rpm = (obd_dta[3] << 8) | obd_dta[4];
-            xSemaphoreGive(__obd_info_mutex);
+            xSemaphoreTake(obd_info_mutex, portMAX_DELAY);
+            obd_rpm = (obd_dta[2] << 8) | obd_dta[3];
+            xSemaphoreGive(obd_info_mutex);
         }
-
-        // // get speed
-        // res = obdPidRequestBlocking(CAN_VMCU_ID, CAN_SPEED_PID, &obd_len, obd_dta, 200);
-        // if (res > 0 && obd_len == 3)
-        // {
-        //     xSemaphoreTake(__obd_info_mutex, portMAX_DELAY);
-        //     __obd_speed = obd_dta[3];
-        //     xSemaphoreGive(__obd_info_mutex);
-        // }
     }
 }
 
@@ -300,6 +226,7 @@ void displayTask(void *pv_parameters)
     /* More data bus class: https://github.com/moononournation/Arduino_GFX/wiki/Data-Bus-Class */
     Arduino_DataBus *bus = new Arduino_HWSPI(TFT_DC, TFT_CS);
     Arduino_GFX *gfx = new Arduino_ILI9488_18bit(bus, TFT_RESET, 1 /* rotation */, false /* IPS */);
+    ThreeFX_Fixed *tfx = new ThreeFX_Fixed(gfx);
     gfx->begin();
 
     // light up display and wipe screen
@@ -307,8 +234,8 @@ void displayTask(void *pv_parameters)
     digitalWrite(GFX_BL, HIGH);
     gfx->fillScreen(BLACK);
 
-    int32_t rpm;
-    int32_t oldRpm;
+    int32_t rpm = 0;
+    int32_t oldRpm = 99999;
     int32_t speed;
     int32_t oldSpeed;
 
@@ -319,14 +246,9 @@ void displayTask(void *pv_parameters)
     // init with current time for updates
     x_last_wake_time = xTaskGetTickCount();
 
-    // ready zPlaneLines background
-    initGridWorldCoordinates();
-
     // draw first frame
-    drawRPMHeader(gfx, 40, 40, CYAN);     
-    drawRPM(gfx, 40, 40, rpm, CYAN);   
-    drawZPlaneVert(gfx, Z_PLANE_COLOR);
-    drawZPlaneHoriz(gfx, Z_PLANE_COLOR);
+    drawRPMHeader(gfx, RPM_X, RPM_Y, CYAN);     
+    updateRPM(gfx, RPM_X, RPM_Y, rpm, oldRpm, CYAN, BLACK);   
 
     for (;;)
     {
@@ -334,31 +256,23 @@ void displayTask(void *pv_parameters)
         vTaskDelayUntil(&x_last_wake_time, x_period);
 
         // grab obd info 
-        xSemaphoreTake(__obd_info_mutex, portMAX_DELAY);
-        rpm = __obd_rpm;
-        speed = __obd_speed;
-        xSemaphoreGive(__obd_info_mutex);
+        xSemaphoreTake(obd_info_mutex, portMAX_DELAY);
+        rpm = obd_rpm;
+        speed = obd_speed;
+        xSemaphoreGive(obd_info_mutex);
 
         rpm /= 4;
 
         // update tach display
         if (oldRpm != rpm)
         {
-            drawRPM(gfx, 40, 40, oldRpm, BLACK);
+            // drawRPM(gfx, 40, 40, oldRpm, BLACK);
 
-            // draw next frame
-            drawRPM(gfx, 40, 40, rpm, CYAN);
+            // // draw next frame
+            // drawRPM(gfx, 40, 40, rpm, CYAN);
+            updateRPM(gfx, RPM_X, RPM_Y, rpm, oldRpm, CYAN, BLACK);
         }
         oldRpm = rpm;
-
-        //update grid display (causes flickering)
-        // drawZPlaneVert(gfx, BLACK);
-        // drawZPlaneHoriz(gfx, BLACK);
-        // updateGridWorldCoordinates(
-        //     (rpm / RPM_SCALE) + RPM_B, 
-        //     (speed / SPEED_SCALE) + SPEED_B);
-        // drawZPlaneVert(gfx, Z_PLANE_COLOR);
-        // drawZPlaneHoriz(gfx, Z_PLANE_COLOR);
     }
 }
 
@@ -368,22 +282,20 @@ void displayTask(void *pv_parameters)
 
 void setup()
 {
-    if (DEBUG)
-    {
-        Serial.begin(115200);
-        vTaskDelay(2500);
-    }
+    Serial.begin(115200);
+    LOG_ATTACH_SERIAL(Serial);
+    vTaskDelay(5000);
 
-    __obd_info_mutex = xSemaphoreCreateMutex();
+    obd_info_mutex = xSemaphoreCreateMutex();
 
-    debug_println("Starting tasks...");
+    LOG_INFO("Starting tasks...");
     xTaskCreatePinnedToCore(
         obdTask,
         "OBD Task",
         OBD_DATA_BUF_LEN + 4096,
         nullptr,
         5,
-        &__obd_task_handle,
+        &obd_task_handle,
         1);
 
     xTaskCreatePinnedToCore(
@@ -392,7 +304,7 @@ void setup()
         65536,
         nullptr,
         5,
-        &__displayTask_handle,
+        &displayTask_handle,
         1);
 }
 
